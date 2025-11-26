@@ -11,14 +11,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -31,6 +35,8 @@ import java.util.stream.Collectors;
 public final class ChatNode {
     private static final Duration HEARTBEAT_INTERVAL = Duration.ofSeconds(2);
     private static final Duration PEER_TTL = Duration.ofSeconds(10);
+    private static final Duration CHAT_ACK_TIMEOUT = Duration.ofMillis(1200);
+    private static final int CHAT_MAX_RETRIES = 3;
     private static final List<String> ROBOT_LINES = List.of(
             "Distributed dreams never sleep.",
             "Who dropped a packet? Own up!",
@@ -62,6 +68,9 @@ public final class ChatNode {
     private final ExternalHttpServer httpServer;
     private final boolean headless;
     private ScheduledFuture<?> discoveryTask;
+    private final Map<String, ConcurrentHashMap<UUID, Long>> lamportTracker = new ConcurrentHashMap<>();
+    private static final int MAX_AUTO_RESEND_IDS = 5;
+    private final Map<String, OutstandingChat> pendingChats = new ConcurrentHashMap<>();
 
     private ChatNode(NodeConfig config) throws Exception {
         this.config = config;
@@ -160,6 +169,7 @@ public final class ChatNode {
         sendInitialHelloes();
         scheduler.scheduleAtFixedRate(this::sendHeartbeats, 1, HEARTBEAT_INTERVAL.toSeconds(), TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(this::purgeStalePeers, 5, 5, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::retryPendingChats, 1, 1, TimeUnit.SECONDS);
         if (!headless) {
             scheduler.execute(() -> new ConsoleShell(this::handleConsoleLine).run());
         } else {
@@ -515,9 +525,25 @@ public final class ChatNode {
         System.out.println("[system] " + message);
     }
 
+    private void sendChatAck(InetSocketAddress destination, String messageId, String room) {
+        Packet ack = Packet.builder(MessageType.CHAT_ACK)
+                .put("nodeId", config.nodeId().toString())
+                .put("mid", messageId)
+                .put("room", room)
+                .build();
+        datagram.send(destination, ack);
+    }
+
     private void broadcastChat(ChatMessage message, boolean relay, boolean historyMode) {
         Packet packet = packetForMessage(MessageType.CHAT, message, relay, historyMode);
-        datagram.broadcast(peers.peerAddresses(message.room(), message.originId()), packet);
+        List<InetSocketAddress> destinations = peers.peerAddresses(message.room(), message.originId());
+        if (historyMode) {
+            datagram.broadcast(destinations, packet);
+        } else {
+            for (InetSocketAddress destination : destinations) {
+                sendReliableChat(destination, packet);
+            }
+        }
     }
 
     private void broadcastFilePacket(Packet packet) {
@@ -584,6 +610,67 @@ public final class ChatNode {
         }
     }
 
+    private long lastSeenLamport(String room, UUID origin) {
+        return lamportTracker
+                .computeIfAbsent(room, key -> new ConcurrentHashMap<>())
+                .getOrDefault(origin, 0L);
+    }
+
+    private void recordLamport(String room, UUID origin, long lamport) {
+        lamportTracker
+                .computeIfAbsent(room, key -> new ConcurrentHashMap<>())
+                .merge(origin, lamport, Math::max);
+    }
+
+    private List<String> missingMessageIds(UUID origin, long previousLamport, long currentLamport) {
+        List<String> ids = new ArrayList<>();
+        if (currentLamport <= previousLamport + 1) {
+            return ids;
+        }
+        long start = Math.max(previousLamport + 1, currentLamport - MAX_AUTO_RESEND_IDS);
+        for (long lamport = start; lamport < currentLamport; lamport++) {
+            ids.add(origin + ":" + lamport);
+        }
+        return ids;
+    }
+
+    private void sendReliableChat(InetSocketAddress destination, Packet packet) {
+        String mid = packet.fields().get("mid");
+        if (mid == null) {
+            datagram.send(destination, packet);
+            return;
+        }
+        String key = reliableKey(destination, mid);
+        pendingChats.put(key, new OutstandingChat(packet, destination, mid, CHAT_MAX_RETRIES, System.nanoTime() + CHAT_ACK_TIMEOUT.toNanos()));
+        datagram.send(destination, packet);
+    }
+
+    private void retryPendingChats() {
+        if (!running.get()) {
+            return;
+        }
+        long now = System.nanoTime();
+        List<String> toRemove = new ArrayList<>();
+        pendingChats.forEach((key, pending) -> {
+            if (pending.nextRetryNanos() > now) {
+                return;
+            }
+            if (pending.remainingRetries() <= 0) {
+                System.out.printf("Giving up on delivery of %s to %s after %d attempts.%n",
+                        pending.messageId(), pending.destination(), CHAT_MAX_RETRIES + 1);
+                toRemove.add(key);
+                return;
+            }
+            datagram.send(pending.destination(), pending.packet());
+            pending.decrementRetries(CHAT_ACK_TIMEOUT);
+        });
+        toRemove.forEach(pendingChats::remove);
+    }
+
+    private static String reliableKey(InetSocketAddress destination, String mid) {
+        return destination.getHostString() + ":" + destination.getPort() + "|" + mid;
+    }
+
     private final class MessageRouter implements DatagramService.PacketProcessor {
         @Override
         public void handle(InetSocketAddress source, Packet packet) {
@@ -600,6 +687,7 @@ public final class ChatNode {
                 case WELCOME -> onWelcome(source, packet);
                 case PEERS -> onPeers(packet);
                 case CHAT -> onChat(source, packet);
+                case CHAT_ACK -> onChatAck(source, packet);
                 case HISTORY_REQ -> onHistoryReq(source, packet);
                 case HISTORY_DONE -> onHistoryDone(source, packet);
                 case HEARTBEAT -> onHeartbeat(packet);
@@ -675,6 +763,8 @@ public final class ChatNode {
             String nick = packet.require("nick");
             String text = packet.require("text");
             String messageRoom = packet.getOrDefault("room", currentRoom());
+            boolean historical = "1".equals(packet.getOrDefault("history", "0"))
+                    || packet.type() == MessageType.RESEND_RES;
             PeerInfo peer = peers.byNodeId(origin)
                     .orElseGet(() -> peers.identifyPeer(source, origin, nick, messageRoom));
             if (peer != null) {
@@ -683,6 +773,18 @@ public final class ChatNode {
             if (!currentRoom().equals(messageRoom)) {
                 return;
             }
+            sendChatAck(source, messageId, messageRoom);
+            long previousLamport = lastSeenLamport(messageRoom, origin);
+            if (!historical && remoteClock > previousLamport + 1) {
+                List<String> missingIds = missingMessageIds(origin, previousLamport, remoteClock);
+                if (!missingIds.isEmpty()) {
+                    historySync.requestSpecific(missingIds);
+                    System.out.printf(
+                            "Detected gap from %s in room %s (expected %d, saw %d). Requesting %d missing id(s).%n",
+                            origin, messageRoom, previousLamport + 1, remoteClock, missingIds.size());
+                }
+            }
+            recordLamport(messageRoom, origin, remoteClock);
             clock.observe(remoteClock);
             ChatMessage message = new ChatMessage(messageId, origin, nick, remoteClock, timestamp, text, messageRoom);
             boolean fresh = history.add(messageRoom, message);
@@ -751,6 +853,12 @@ public final class ChatNode {
                         datagram.send(source, response);
                     }));
         }
+
+        private void onChatAck(InetSocketAddress source, Packet packet) {
+            String mid = packet.require("mid");
+            String key = reliableKey(source, mid);
+            pendingChats.remove(key);
+        }
     }
 
     private final class HistorySyncService {
@@ -800,9 +908,23 @@ public final class ChatNode {
         }
 
         void requestSpecific(String messageId) {
+            requestSpecific(List.of(messageId));
+        }
+
+        void requestSpecific(Collection<String> messageIds) {
+            if (messageIds == null) {
+                return;
+            }
+            String ids = messageIds.stream()
+                    .filter(id -> id != null && !id.isBlank())
+                    .distinct()
+                    .collect(Collectors.joining(","));
+            if (ids.isEmpty()) {
+                return;
+            }
             Packet request = Packet.builder(MessageType.RESEND_REQ)
                     .put("nodeId", config.nodeId().toString())
-                    .put("ids", messageId)
+                    .put("ids", ids)
                     .put("room", currentRoom())
                     .build();
             broadcast(request);
@@ -838,6 +960,47 @@ public final class ChatNode {
         void shutdown() {
             stop();
             executor.shutdownNow();
+        }
+    }
+
+    private static final class OutstandingChat {
+        private final Packet packet;
+        private final InetSocketAddress destination;
+        private final String messageId;
+        private int remainingRetries;
+        private long nextRetryNanos;
+
+        OutstandingChat(Packet packet, InetSocketAddress destination, String messageId, int remainingRetries, long nextRetryNanos) {
+            this.packet = packet;
+            this.destination = destination;
+            this.messageId = messageId;
+            this.remainingRetries = remainingRetries;
+            this.nextRetryNanos = nextRetryNanos;
+        }
+
+        Packet packet() {
+            return packet;
+        }
+
+        InetSocketAddress destination() {
+            return destination;
+        }
+
+        String messageId() {
+            return messageId;
+        }
+
+        int remainingRetries() {
+            return remainingRetries;
+        }
+
+        long nextRetryNanos() {
+            return nextRetryNanos;
+        }
+
+        void decrementRetries(Duration delay) {
+            remainingRetries = Math.max(0, remainingRetries - 1);
+            nextRetryNanos = System.nanoTime() + delay.toNanos();
         }
     }
 

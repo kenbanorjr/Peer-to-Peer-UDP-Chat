@@ -5,6 +5,7 @@ public enum MessageType {
     WELCOME,
     PEERS,
     CHAT,
+    CHAT_ACK,
     HISTORY_REQ,
     HISTORY_DONE,
     HEARTBEAT,
