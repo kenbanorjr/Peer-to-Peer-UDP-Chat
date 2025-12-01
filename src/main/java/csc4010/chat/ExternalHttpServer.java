@@ -17,34 +17,41 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * Minimal HTTP interface so external services can post chat messages or fetch history.
+ * HTTP interface so external services/GUI can post chat messages, fetch history, and drive node controls.
  */
 public final class ExternalHttpServer implements Closeable {
     public record ExternalMessage(String text, String nickname) {}
     public record HealthSnapshot(String nodeId, String nickname, int peers, int messages) {}
+    public record ControlCommand(String action, Map<String, String> params) {}
+    public record ControlResult(boolean ok, String message) {}
 
     private final HttpServer server;
     private final ExecutorService executor = Executors.newFixedThreadPool(2);
     private final Consumer<ExternalMessage> messageConsumer;
     private final Supplier<List<ChatMessage>> historySupplier;
     private final Supplier<HealthSnapshot> healthSupplier;
+    private final Function<ControlCommand, ControlResult> controlHandler;
 
     public ExternalHttpServer(
             int port,
             Consumer<ExternalMessage> messageConsumer,
             Supplier<List<ChatMessage>> historySupplier,
-            Supplier<HealthSnapshot> healthSupplier) throws IOException {
+            Supplier<HealthSnapshot> healthSupplier,
+            Function<ControlCommand, ControlResult> controlHandler) throws IOException {
         this.messageConsumer = messageConsumer;
         this.historySupplier = historySupplier;
         this.healthSupplier = healthSupplier;
+        this.controlHandler = controlHandler;
 
         this.server = HttpServer.create(new InetSocketAddress(port), 0);
         this.server.createContext("/chat", new ChatHandler());
         this.server.createContext("/history", new HistoryHandler());
         this.server.createContext("/health", new HealthHandler());
+        this.server.createContext("/control", new ControlHandler());
         this.server.setExecutor(executor);
     }
 
@@ -124,6 +131,30 @@ public final class ExternalHttpServer implements Closeable {
                     snapshot.peers(),
                     snapshot.messages());
             respond(exchange, 200, payload);
+        }
+    }
+
+    private final class ControlHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                respond(exchange, 405, "{\"ok\":false,\"message\":\"Only POST supported.\"}");
+                return;
+            }
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            Map<String, String> params = new LinkedHashMap<>(parseQuery(exchange.getRequestURI()));
+            params.putAll(parseParams(body));
+            String action = params.remove("action");
+            if (action == null || action.isBlank()) {
+                respond(exchange, 400, "{\"ok\":false,\"message\":\"Missing action\"}");
+                return;
+            }
+            ControlCommand command = new ControlCommand(action, params);
+            ControlResult result = controlHandler.apply(command);
+            boolean ok = result != null && result.ok();
+            String message = result == null ? "" : result.message();
+            String payload = "{\"ok\":" + ok + ",\"message\":" + toJson(message) + "}";
+            respond(exchange, ok ? 200 : 400, payload);
         }
     }
 

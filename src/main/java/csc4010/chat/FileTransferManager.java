@@ -19,6 +19,7 @@ import java.util.function.Consumer;
  */
 public final class FileTransferManager {
     private static final int CHUNK_SIZE = 6144;
+    private static final int CHUNK_RETRIES = 2;
     private final Path downloadDirectory;
     private final Consumer<String> notifier;
     private final Map<String, IncomingFile> incoming = new ConcurrentHashMap<>();
@@ -41,7 +42,10 @@ public final class FileTransferManager {
                 .put("size", size)
                 .put("chunks", chunkCount)
                 .build();
-        sender.accept(meta);
+        // Send meta multiple times to improve odds over lossy links
+        for (int attempt = 0; attempt <= CHUNK_RETRIES; attempt++) {
+            sender.accept(meta);
+        }
         notifier.accept("Sending file " + file.getFileName() + " (" + size + " bytes) in " + chunkCount + " chunks.");
         try (InputStream input = Files.newInputStream(file, StandardOpenOption.READ)) {
             byte[] buffer = new byte[CHUNK_SIZE];
@@ -54,7 +58,10 @@ public final class FileTransferManager {
                         .put("seq", seq)
                         .put("data", Base64.getEncoder().encodeToString(payload))
                         .build();
-                sender.accept(chunk);
+                // Send each chunk multiple times to mitigate loss (no ACKs in UDP path)
+                for (int attempt = 0; attempt <= CHUNK_RETRIES; attempt++) {
+                    sender.accept(chunk);
+                }
                 seq++;
             }
         }

@@ -82,8 +82,11 @@ Optional flags:
 - `--log logs/transcript.txt` append the ordered chat log to a file for external integrations.
 - `--http-port 8080` expose an HTTP API (`POST /chat`, `GET /history`, `GET /health`).
 - `--port auto` (or `--port 0`) lets the OS pick a free UDP port automatically—handy on lab machines where 5000 is busy. The node logs the actual port it binds to.
+- `--fanout 0` limit broadcast fan-out per relay (0 = send to all); `--ttl 0` sets chat relay hop limit (0 = unlimited). These help scale larger swarms without affecting small demos.
+- `--history-page 64` chunk history replay into pages of this size to avoid large bursts when new nodes sync.
 - `--discover-port 57500` adjust the UDP discovery beacon port (use `--no-discovery` to disable). If a port is taken the node will automatically try the next few values and warn you.
 - `--downloads path\to\folder` change where incoming binary files are saved (default `downloads/`).
+- `--gui` auto-starts the Swing GUI after the HTTP API comes up (auto-picks an HTTP port if you didn’t pass `--http-port`).
 
 ## Console Commands
 | Command | Description |
@@ -120,14 +123,20 @@ Optional flags:
 This allows bots, scripts, or other applications to publish chat lines or poll node status without a console.
 
 ### Swing GUI (Wow-factor add-on)
-If you want a lightweight GUI on top of the HTTP API, launch a node with the HTTP endpoint enabled and start the `ChatGuiApp`:
+Fastest way: start a node with `--gui` (HTTP auto-binds if needed and the GUI launches):
+
+```powershell
+java -cp bin csc4010.chat.ChatNode --port 5000 --nick Alice --http-port 8080 --gui
+```
+
+Prefer to attach from another machine or without auto-launch? Start the node with HTTP, then run the GUI separately:
 
 ```powershell
 java -cp bin csc4010.chat.ChatNode --port 5000 --nick Alice --http-port 8080
 java -cp bin csc4010.chat.ChatGuiApp --server http://localhost:8080 --nick Alice-GUI
 ```
 
-The GUI polls `/history` every couple of seconds, streams all Lamport-ordered chat into a scrolling window, and lets you post chat lines (optionally under a custom nickname) via `POST /chat`. Use `--refresh 1` to poll more aggressively or point `--server` at any other peer exposing the HTTP API.
+The GUI polls `/history`, shows the ordered log, and posts via `/chat`. Use `--refresh 1` on the GUI to poll more aggressively or point `--server` at any peer exposing the HTTP API.
 
 ## Discovery Without Seeds
 - Nodes listen on UDP discovery port `57500` (change with `--discover-port`).  

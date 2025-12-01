@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.BindException;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -14,6 +15,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -24,6 +26,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -68,15 +71,24 @@ public final class ChatNode {
     private final ExternalHttpServer httpServer;
     private final boolean headless;
     private ScheduledFuture<?> discoveryTask;
+    private final int gossipFanout;
+    private final int messageTtl;
+    private final int historyPageSize;
+    private final boolean launchGui;
     private final Map<String, ConcurrentHashMap<UUID, Long>> lamportTracker = new ConcurrentHashMap<>();
     private static final int MAX_AUTO_RESEND_IDS = 5;
     private final Map<String, OutstandingChat> pendingChats = new ConcurrentHashMap<>();
+    private static final boolean INTERNAL_LOGS = false;
 
     private ChatNode(NodeConfig config) throws Exception {
         this.config = config;
         this.nickname = new AtomicReference<>(config.nickname());
         this.room = new AtomicReference<>(config.room());
         this.dropSimulator = new DropSimulator(config.dropInRate(), config.dropOutRate());
+        this.gossipFanout = config.gossipFanout();
+        this.messageTtl = config.messageTtl();
+        this.historyPageSize = config.historyPageSize();
+        this.launchGui = config.launchGui();
         DatagramBinding binding = initDatagramService(config.listenPort());
         this.datagram = binding.service();
         this.listenPort = binding.port();
@@ -93,7 +105,8 @@ public final class ChatNode {
                     config.httpPort().get(),
                     this::handleExternalMessage,
                     () -> history.snapshot(currentRoom()),
-                    this::healthSnapshot);
+                    this::healthSnapshot,
+                    this::handleControl);
         } else {
             this.httpServer = null;
         }
@@ -165,6 +178,9 @@ public final class ChatNode {
         if (httpServer != null) {
             httpServer.start();
             System.out.println("HTTP API listening on http://localhost:" + httpServer.port());
+            if (launchGui) {
+                launchGuiClient();
+            }
         }
         sendInitialHelloes();
         scheduler.scheduleAtFixedRate(this::sendHeartbeats, 1, HEARTBEAT_INTERVAL.toSeconds(), TimeUnit.SECONDS);
@@ -245,7 +261,7 @@ public final class ChatNode {
         }
         Packet hello = identityPacket(MessageType.HELLO)
                 .put("clock", clock.current())
-                .put("askHistory", history.size(currentRoom()) == 0 ? "1" : "0")
+                .put("askHistory", "1")
                 .build();
         datagram.broadcast(config.seedPeers(), hello);
     }
@@ -256,7 +272,7 @@ public final class ChatNode {
                 .put("clock", clock.current())
                 .put("room", currentRoom())
                 .build();
-        datagram.broadcast(peers.peerAddresses(currentRoom(), null), heartbeat);
+        broadcastToPeers(currentRoom(), null, heartbeat);
     }
 
     private void purgeStalePeers() {
@@ -287,8 +303,7 @@ public final class ChatNode {
             case "sync" -> historySync.requestFromAnyPeer();
             case "clear" -> {
                 history.clear(currentRoom());
-                System.out.println("Local log cleared for room " + currentRoom() + ".");
-                historySync.requestFromAnyPeer();
+                System.out.println("Local log cleared for room " + currentRoom() + ". Use /sync to fetch history.");
             }
             case "robot" -> handleRobotCommand(parts);
             case "drop" -> handleDropCommand(parts);
@@ -405,7 +420,7 @@ public final class ChatNode {
         System.out.println("Switched to room " + targetRoom + ". Requesting peers/history...");
         Packet announce = identityPacket(MessageType.HELLO)
                 .put("clock", clock.tick())
-                .put("askHistory", history.size(targetRoom) == 0 ? "1" : "0")
+                .put("askHistory", "1")
                 .build();
         datagram.broadcast(peers.peerAddresses(currentRoom(), null), announce);
         if (discoveryService != null) {
@@ -421,11 +436,16 @@ public final class ChatNode {
         }
         Path file = Path.of(parts[1]);
         try {
-            String fileId = config.nodeId() + ":file:" + clock.tick();
-            fileTransferManager.sendFile(file, fileId, this::broadcastFilePacket);
+            System.out.println(sendFileToPeers(file));
         } catch (IOException ioe) {
             System.out.println("Failed to send file: " + ioe.getMessage());
         }
+    }
+
+    private String sendFileToPeers(Path file) throws IOException {
+        String fileId = config.nodeId() + ":file:" + clock.tick();
+        fileTransferManager.sendFile(file, fileId, this::broadcastFilePacket);
+        return "File transfer scheduled for " + file.getFileName();
     }
 
     private void triggerDiscovery() {
@@ -435,6 +455,114 @@ public final class ChatNode {
         }
         discoveryService.broadcastProbe();
         System.out.println("Discovery probe broadcast.");
+    }
+
+    private String triggerDiscoveryCommand() {
+        if (discoveryService == null) {
+            return "Discovery is disabled.";
+        }
+        discoveryService.broadcastProbe();
+        return "Discovery probe broadcast.";
+    }
+
+    private String switchRoom(String name) {
+        if (name == null || name.isBlank()) {
+            return "Room name cannot be empty.";
+        }
+        String target = name.trim();
+        String previous = currentRoom();
+        if (previous.equals(target)) {
+            return "Already in room " + target + ".";
+        }
+        Packet goodbye = identityPacket(MessageType.LEAVE).build();
+        datagram.broadcast(peers.peerAddresses(previous, null), goodbye);
+        room.set(target);
+        Packet announce = identityPacket(MessageType.HELLO)
+                .put("clock", clock.tick())
+                .put("askHistory", "1")
+                .build();
+        datagram.broadcast(peers.peerAddresses(currentRoom(), null), announce);
+        if (discoveryService != null) {
+            discoveryService.broadcastProbe();
+        }
+        historySync.requestFromAnyPeer();
+        return "Switched to room " + target + " and requested history sync.";
+    }
+
+    private String requestHistorySync() {
+        historySync.requestFromAnyPeer();
+        return "Requested history sync.";
+    }
+
+    private String clearHistory() {
+        history.clear(currentRoom());
+        historySync.requestFromAnyPeer();
+        return "Local log cleared; requesting sync.";
+    }
+
+    private String startRobot(int seconds) {
+        int interval = Math.max(1, seconds);
+        robotSpeaker.start(interval);
+        return "Robot chatting every " + interval + "s.";
+    }
+
+    private String stopRobot() {
+        robotSpeaker.stop();
+        return "Robot stopped.";
+    }
+
+    private String setDropRate(boolean inbound, double rate) {
+        double clamped = Math.max(0.0d, Math.min(1.0d, rate));
+        if (inbound) {
+            dropSimulator.setInbound(clamped);
+        } else {
+            dropSimulator.setOutbound(clamped);
+        }
+        return String.format(Locale.ROOT, "Drops -> inbound=%.2f outbound=%.2f", dropSimulator.inboundRate(), dropSimulator.outboundRate());
+    }
+
+    private String updateNickname(String newNick) {
+        if (newNick == null || newNick.isBlank()) {
+            return "Nickname cannot be empty.";
+        }
+        nickname.set(newNick.trim());
+        Packet announce = identityPacket(MessageType.HELLO)
+                .put("clock", clock.tick())
+                .put("askHistory", "0")
+                .build();
+        broadcast(announce);
+        return "Nickname updated to " + nickname.get();
+    }
+
+    private String requestResend(String idsRaw) {
+        if (idsRaw == null || idsRaw.isBlank()) {
+            return "Provide one or more message ids.";
+        }
+        historySync.requestSpecific(idsRaw);
+        return "Requested resend.";
+    }
+
+    private String forgetMessage(String id) {
+        if (id == null || id.isBlank()) {
+            return "Provide a message id.";
+        }
+        if (history.remove(currentRoom(), id.trim())) {
+            return "Locally removed " + id.trim();
+        }
+        return "Message not known.";
+    }
+
+    private void launchGuiClient() {
+        if (httpServer == null) {
+            System.err.println("Cannot launch GUI without HTTP API.");
+            return;
+        }
+        URI serverUri = URI.create("http://localhost:" + httpServer.port());
+        String guiNick = nickname.get() + "-gui";
+        Thread thread = new Thread(() -> ChatGuiApp.launch(serverUri, guiNick, 2), "chat-gui-launcher");
+        thread.setDaemon(true);
+        thread.start();
+        System.out.println("Swing GUI launched. Connect at " + serverUri + " (nick " + guiNick + ").");
     }
 
     private void publishLocalMessage(String text, boolean robot) {
@@ -492,11 +620,37 @@ public final class ChatNode {
     }
 
     private void broadcast(Packet packet) {
-        datagram.broadcast(peers.peerAddresses(currentRoom(), null), packet);
+        broadcastToPeers(currentRoom(), null, packet);
     }
 
-    private Packet packetForMessage(MessageType type, ChatMessage message, boolean relay, boolean historyMode) {
-        return Packet.builder(type)
+    private void broadcastToPeers(String room, UUID exclude, Packet packet) {
+        List<InetSocketAddress> destinations = applyFanout(peers.peerAddresses(room, exclude));
+        datagram.broadcast(destinations, packet);
+    }
+
+    private List<InetSocketAddress> applyFanout(List<InetSocketAddress> destinations) {
+        if (gossipFanout <= 0 || destinations.size() <= gossipFanout) {
+            return destinations;
+        }
+        List<InetSocketAddress> shuffled = new ArrayList<>(destinations);
+        Collections.shuffle(shuffled, ThreadLocalRandom.current());
+        return shuffled.subList(0, gossipFanout);
+    }
+
+    private int remainingTtl(Packet packet) {
+        String raw = packet.getOrDefault("ttl", null);
+        if (raw == null) {
+            return messageTtl;
+        }
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException ignored) {
+            return messageTtl;
+        }
+    }
+
+    private Packet packetForMessage(MessageType type, ChatMessage message, boolean relay, boolean historyMode, int ttl) {
+        Packet.Builder builder = Packet.builder(type)
                 .put("mid", message.messageId())
                 .put("origin", message.originId().toString())
                 .put("nick", message.nickname())
@@ -505,8 +659,11 @@ public final class ChatNode {
                 .put("text", message.text())
                 .put("room", message.room())
                 .put("relay", relay ? "1" : "0")
-                .put("history", historyMode ? "1" : "0")
-                .build();
+                .put("history", historyMode ? "1" : "0");
+        if (ttl > 0) {
+            builder.put("ttl", ttl);
+        }
+        return builder.build();
     }
 
     private void handleExternalMessage(ExternalHttpServer.ExternalMessage message) {
@@ -519,6 +676,37 @@ public final class ChatNode {
                 nickname.get(),
                 peers.peerAddresses(currentRoom(), null).size(),
                 history.size(currentRoom()));
+    }
+
+    private ExternalHttpServer.ControlResult handleControl(ExternalHttpServer.ControlCommand command) {
+        if (command == null || command.action() == null) {
+            return new ExternalHttpServer.ControlResult(false, "Missing action");
+        }
+        Map<String, String> params = command.params() == null ? Map.of() : command.params();
+        String action = command.action().toLowerCase(Locale.ROOT);
+        try {
+            return switch (action) {
+                case "room" -> new ExternalHttpServer.ControlResult(true, switchRoom(params.get("name")));
+                case "sync" -> new ExternalHttpServer.ControlResult(true, requestHistorySync());
+                case "clear" -> new ExternalHttpServer.ControlResult(true, clearHistory());
+                case "robot_start" -> new ExternalHttpServer.ControlResult(true, startRobot(Integer.parseInt(params.getOrDefault("seconds", "5"))));
+                case "robot_stop" -> new ExternalHttpServer.ControlResult(true, stopRobot());
+                case "drop_in" -> new ExternalHttpServer.ControlResult(true, setDropRate(true, Double.parseDouble(params.getOrDefault("rate", "0"))));
+                case "drop_out" -> new ExternalHttpServer.ControlResult(true, setDropRate(false, Double.parseDouble(params.getOrDefault("rate", "0"))));
+                case "nick" -> new ExternalHttpServer.ControlResult(true, updateNickname(params.getOrDefault("value", "")));
+                case "sendfile" -> new ExternalHttpServer.ControlResult(true, sendFileToPeers(Path.of(params.getOrDefault("path", ""))));
+                case "discover" -> new ExternalHttpServer.ControlResult(true, triggerDiscoveryCommand());
+                case "resend" -> new ExternalHttpServer.ControlResult(true, requestResend(params.getOrDefault("ids", params.getOrDefault("id", ""))));
+                case "forget" -> new ExternalHttpServer.ControlResult(true, forgetMessage(params.getOrDefault("id", "")));
+                case "quit" -> {
+                    scheduler.execute(this::shutdown);
+                    yield new ExternalHttpServer.ControlResult(true, "Node shutting down.");
+                }
+                default -> new ExternalHttpServer.ControlResult(false, "Unknown action: " + action);
+            };
+        } catch (Exception ex) {
+            return new ExternalHttpServer.ControlResult(false, "Error: " + ex.getMessage());
+        }
     }
 
     private void logSystem(String message) {
@@ -535,8 +723,9 @@ public final class ChatNode {
     }
 
     private void broadcastChat(ChatMessage message, boolean relay, boolean historyMode) {
-        Packet packet = packetForMessage(MessageType.CHAT, message, relay, historyMode);
-        List<InetSocketAddress> destinations = peers.peerAddresses(message.room(), message.originId());
+        int ttl = messageTtl;
+        Packet packet = packetForMessage(MessageType.CHAT, message, relay, historyMode, ttl);
+        List<InetSocketAddress> destinations = applyFanout(peers.peerAddresses(message.room(), message.originId()));
         if (historyMode) {
             datagram.broadcast(destinations, packet);
         } else {
@@ -557,7 +746,7 @@ public final class ChatNode {
         peers.addSeed(address);
         Packet hello = identityPacket(MessageType.HELLO)
                 .put("clock", clock.current())
-                .put("askHistory", history.size(currentRoom()) == 0 ? "1" : "0")
+                .put("askHistory", "1")
                 .build();
         datagram.send(address, hello);
         stopDiscoveryTaskIfConnected();
@@ -586,7 +775,9 @@ public final class ChatNode {
                 .put("nodeId", config.nodeId().toString())
                 .put("list", payload)
                 .build();
-        Iterable<InetSocketAddress> dest = targets == null ? peers.peerAddresses(activeRoom, null) : targets;
+        List<InetSocketAddress> dest = targets == null
+                ? applyFanout(peers.peerAddresses(activeRoom, null))
+                : targets;
         datagram.broadcast(dest, packet);
     }
 
@@ -627,8 +818,9 @@ public final class ChatNode {
         if (currentLamport <= previousLamport + 1) {
             return ids;
         }
-        long start = Math.max(previousLamport + 1, currentLamport - MAX_AUTO_RESEND_IDS);
-        for (long lamport = start; lamport < currentLamport; lamport++) {
+        long start = previousLamport + 1;
+        long end = Math.min(currentLamport, start + MAX_AUTO_RESEND_IDS);
+        for (long lamport = start; lamport < end; lamport++) {
             ids.add(origin + ":" + lamport);
         }
         return ids;
@@ -656,8 +848,10 @@ public final class ChatNode {
                 return;
             }
             if (pending.remainingRetries() <= 0) {
-                System.out.printf("Giving up on delivery of %s to %s after %d attempts.%n",
-                        pending.messageId(), pending.destination(), CHAT_MAX_RETRIES + 1);
+                if (INTERNAL_LOGS) {
+                    System.out.printf("Giving up on delivery of %s to %s after %d attempts.%n",
+                            pending.messageId(), pending.destination(), CHAT_MAX_RETRIES + 1);
+                }
                 toRemove.add(key);
                 return;
             }
@@ -749,7 +943,7 @@ public final class ChatNode {
                         peers.addSeed(address);
                         Packet hello = identityPacket(MessageType.HELLO)
                                 .put("clock", clock.current())
-                                .put("askHistory", history.size(currentRoom()) == 0 ? "1" : "0")
+                                .put("askHistory", "1")
                                 .build();
                         datagram.send(address, hello);
                     });
@@ -775,13 +969,29 @@ public final class ChatNode {
             }
             sendChatAck(source, messageId, messageRoom);
             long previousLamport = lastSeenLamport(messageRoom, origin);
-            if (!historical && remoteClock > previousLamport + 1) {
-                List<String> missingIds = missingMessageIds(origin, previousLamport, remoteClock);
-                if (!missingIds.isEmpty()) {
-                    historySync.requestSpecific(missingIds);
-                    System.out.printf(
-                            "Detected gap from %s in room %s (expected %d, saw %d). Requesting %d missing id(s).%n",
-                            origin, messageRoom, previousLamport + 1, remoteClock, missingIds.size());
+            long gap = remoteClock - previousLamport;
+            if (!historical && gap > 1) {
+                if (gap > MAX_AUTO_RESEND_IDS) {
+                    if (peer != null) {
+                        historySync.requestSnapshot(peer);
+                    } else {
+                        historySync.requestFromAnyPeer();
+                    }
+                    if (INTERNAL_LOGS) {
+                        System.out.printf(
+                                "Detected large gap from %s in room %s (expected %d, saw %d). Requesting full snapshot.%n",
+                                origin, messageRoom, previousLamport + 1, remoteClock);
+                    }
+                } else {
+                    List<String> missingIds = missingMessageIds(origin, previousLamport, remoteClock);
+                    if (!missingIds.isEmpty()) {
+                        historySync.requestSpecific(missingIds);
+                        if (INTERNAL_LOGS) {
+                            System.out.printf(
+                                    "Detected gap from %s in room %s (expected %d, saw %d). Requesting %d missing id(s).%n",
+                                    origin, messageRoom, previousLamport + 1, remoteClock, missingIds.size());
+                        }
+                    }
                 }
             }
             recordLamport(messageRoom, origin, remoteClock);
@@ -789,13 +999,18 @@ public final class ChatNode {
             ChatMessage message = new ChatMessage(messageId, origin, nick, remoteClock, timestamp, text, messageRoom);
             boolean fresh = history.add(messageRoom, message);
             if (fresh) {
+                int ttl = remainingTtl(packet);
                 String marker = "1".equals(packet.getOrDefault("history", "0"))
                         ? "[history]"
                         : (packet.type() == MessageType.RESEND_RES ? "[resend]" : null);
                 displayMessage(message, marker);
                 if ("1".equals(packet.getOrDefault("relay", "1")) && packet.type() == MessageType.CHAT) {
-                    Packet relayPacket = packetForMessage(MessageType.CHAT, message, true, false);
-                    datagram.broadcast(peers.peerAddresses(messageRoom, origin), relayPacket);
+                    int nextTtl = ttl > 0 ? ttl - 1 : ttl;
+                    if (ttl == 0 || ttl > 1) {
+                        Packet relayPacket = packetForMessage(MessageType.CHAT, message, true, false, nextTtl);
+                        List<InetSocketAddress> destinations = applyFanout(peers.peerAddresses(messageRoom, origin));
+                        datagram.broadcast(destinations, relayPacket);
+                    }
                 }
             }
         }
@@ -849,7 +1064,7 @@ public final class ChatNode {
                     .map(String::trim)
                     .filter(id -> !id.isEmpty())
                     .forEach(id -> history.get(reqRoom, id).ifPresent(message -> {
-                        Packet response = packetForMessage(MessageType.RESEND_RES, message, false, true);
+                        Packet response = packetForMessage(MessageType.RESEND_RES, message, false, true, 0);
                         datagram.send(source, response);
                     }));
         }
@@ -896,9 +1111,13 @@ public final class ChatNode {
                 return;
             }
             List<ChatMessage> snapshot = history.snapshot(currentRoom());
-            for (ChatMessage message : snapshot) {
-                Packet packet = packetForMessage(MessageType.CHAT, message, false, true);
-                datagram.send(peer.address(), packet);
+            for (int start = 0; start < snapshot.size(); start += historyPageSize) {
+                int end = Math.min(start + historyPageSize, snapshot.size());
+                List<ChatMessage> page = snapshot.subList(start, end);
+                for (ChatMessage message : page) {
+                    Packet packet = packetForMessage(MessageType.CHAT, message, false, true, 0);
+                    datagram.send(peer.address(), packet);
+                }
             }
             Packet done = Packet.builder(MessageType.HISTORY_DONE)
                     .put("nodeId", config.nodeId().toString())

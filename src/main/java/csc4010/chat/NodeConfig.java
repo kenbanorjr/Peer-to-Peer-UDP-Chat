@@ -27,6 +27,10 @@ public final class NodeConfig {
     private final Optional<Integer> httpPort;
     private final Path downloadDirectory;
     private final String room;
+    private final int gossipFanout;
+    private final int messageTtl;
+    private final int historyPageSize;
+    private final boolean launchGui;
 
     private NodeConfig(
             UUID nodeId,
@@ -43,7 +47,11 @@ public final class NodeConfig {
             int discoveryPort,
             Optional<Integer> httpPort,
             Path downloadDirectory,
-            String room) {
+            String room,
+            int gossipFanout,
+            int messageTtl,
+            int historyPageSize,
+            boolean launchGui) {
         this.nodeId = nodeId;
         this.nickname = nickname;
         this.listenPort = listenPort;
@@ -59,6 +67,10 @@ public final class NodeConfig {
         this.httpPort = httpPort;
         this.downloadDirectory = downloadDirectory;
         this.room = room;
+        this.gossipFanout = gossipFanout;
+        this.messageTtl = messageTtl;
+        this.historyPageSize = historyPageSize;
+        this.launchGui = launchGui;
     }
 
     public UUID nodeId() {
@@ -121,6 +133,22 @@ public final class NodeConfig {
         return room;
     }
 
+    public int gossipFanout() {
+        return gossipFanout;
+    }
+
+    public int messageTtl() {
+        return messageTtl;
+    }
+
+    public int historyPageSize() {
+        return historyPageSize;
+    }
+
+    public boolean launchGui() {
+        return launchGui;
+    }
+
     public static NodeConfig fromArgs(String[] args) {
         String nickname = null;
         Integer port = null;
@@ -136,6 +164,10 @@ public final class NodeConfig {
         Integer httpPort = null;
         Path downloads = Path.of("downloads");
         String room = "lobby";
+        int gossipFanout = 0; // 0 means broadcast to all
+        int messageTtl = 0;   // 0 means unlimited relays
+        int historyPageSize = 64;
+        boolean launchGui = false;
 
         for (int idx = 0; idx < args.length; idx++) {
             String raw = args[idx];
@@ -155,6 +187,7 @@ public final class NodeConfig {
                 case "--headless" -> headless = true;
                 case "--console" -> headless = false;
                 case "--no-discovery" -> discoveryEnabled = false;
+                case "--gui" -> launchGui = true;
                 case "--help", "-h" -> {
                     printUsage();
                     System.exit(0);
@@ -179,6 +212,9 @@ public final class NodeConfig {
                         case "--http-port" -> httpPort = Integer.parseInt(value);
                         case "--downloads" -> downloads = Path.of(value);
                         case "--room" -> room = value.isBlank() ? "lobby" : value;
+                        case "--fanout" -> gossipFanout = Math.max(0, Integer.parseInt(value));
+                        case "--ttl" -> messageTtl = Math.max(0, Integer.parseInt(value));
+                        case "--history-page" -> historyPageSize = Math.max(1, Integer.parseInt(value));
                         default -> throw new IllegalArgumentException("Unknown flag: " + key);
                     }
                 }
@@ -193,6 +229,10 @@ public final class NodeConfig {
         if (nickname == null || nickname.isBlank()) {
             String suffix = nodeId.toString().substring(0, 4).toUpperCase(Locale.ROOT);
             nickname = "Peer-" + suffix;
+        }
+
+        if (launchGui && httpPort == null) {
+            httpPort = 0; // auto-pick HTTP port if GUI requested
         }
 
         return new NodeConfig(
@@ -210,7 +250,11 @@ public final class NodeConfig {
                 discoveryPort,
                 Optional.ofNullable(httpPort),
                 downloads.toAbsolutePath(),
-                room);
+                room,
+                gossipFanout,
+                messageTtl,
+                historyPageSize,
+                launchGui);
     }
 
     private static double clampRate(String value) {
@@ -247,7 +291,8 @@ public final class NodeConfig {
                        [--drop-in 0.1] [--drop-out 0.1] [--robot 5] [--log path]
                        [--lifetime 10] [--headless] [--http-port 8080]
                        [--discover-port 57500] [--no-discovery] [--downloads dir]
-                       [--room lobby]
+                       [--room lobby] [--fanout 0] [--ttl 0] [--history-page 64]
+                       [--gui]
                 """);
     }
 }
