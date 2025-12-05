@@ -1,150 +1,139 @@
 # CSC4010 Distributed UDP Chat
 
-Peer-to-peer chat node implemented in Java for the CSC4010 assessment. Each running instance is a fully-fledged peer that uses UDP for all coordination: membership, messaging, history replay, and recovery.
+Peer-to-peer chat nodes implemented in Java. Every instance is a full peer that exchanges membership, chat, history replay, recovery, file transfer, and control messages over UDP. An optional HTTP API and Swing GUI ride on top.
 
 ## Features
-- Room-scoped chat: every message, history sync, heartbeat, and peer list is tagged with a room so multiple rooms can coexist; switch via `/room <name>` or `--room <name>` (default `lobby`).
-- Pure UDP middleware: every control + chat payload is a UDP datagram (no MQ/RMI/etc).
-- Friendly nicknames plus UUID-backed unique node identifiers.
-- Lamport logical clocks ensure a deterministic ordering of chat items across peers.
-- New peers discover existing members via handshakes, peer-list gossip, and optional directory sharing.
-- Automatic history synchronisation for joining peers and manual `/sync` + `/clear` commands.
-- Robot chatter generator (`/robot start <seconds>`) for demo data.
-- Malformed packet handling and a configurable drop simulator (`/drop in|out <rate>`) to mimic unreliable networks.
-- Missing-data recovery with `/forget` + `/resend <messageId>`.
-- Transcript export to an external file (optional `--log path` flag) for integrations.
-- Zero-config LAN discovery: nodes broadcast/answer discovery beacons so you can join without pre-configured peers.
-- Optional HTTP API for posting chat messages from external services and pulling history/health data.
-- Binary file transfer support with chunked UDP packets saved automatically to a downloads directory.
+- Room-scoped messaging (default `lobby`) with Lamport clocks for deterministic ordering.
+- Gossip-based membership plus zero-config LAN discovery; peers share their peer lists.
+- History sync on join and manual `/sync` + `/clear`; resend missing IDs with `/resend`.
+- Optional HTTP API for bots/integrations and a Swing GUI that speaks to it.
+- Binary file transfer over UDP with chunking and automatic downloads directory.
+- Drop simulator (`--drop-in/--drop-out`), TTL + fan-out limits for scalable relays, and robot chat generator.
+- Transcript logging to disk, resilient retries/acks for chats, and room switching without restart.
 
 ## Project Layout
 ```
 src/main/java/csc4010/chat/
-  ChatNode.java              # main peer process + console + router
-  NodeConfig.java            # CLI parsing + configuration
-  LamportClock.java          # logical clock helper
-  ChatMessage.java           # immutable chat payload
-  MessageStore.java          # ordered chat log
-  PeerInfo.java / PeerRegistry.java
-  MessageType.java / Packet.java / PacketCodec.java
-  DropSimulator.java / DatagramService.java
-docs/ARCHITECTURE.md         # deep dive on the protocol and middleware design
-README.md                    # this file
+  ChatNode.java              # main peer, console shell, router
+  NodeConfig.java            # CLI parsing + immutable config
+  ChatGuiApp.java            # Swing GUI for the HTTP API
+  DiscoveryService.java      # LAN probes/answers
+  DatagramService.java       # UDP socket wrapper + drop simulation
+  Packet / PacketCodec       # UDP packet helpers
+  MessageStore / ChatMessage # ordered log + payload
+  LamportClock.java          # logical clock
+  PeerRegistry.java          # peer tracking by room/id
+  FileTransferManager.java   # chunked file send/receive
+docs/ARCHITECTURE.md         # protocol/design deep dive
+README.md                    # you are here
 ```
 
 ## Requirements
-- **Java 17+** (tested with latest GA OpenJDK)
+- Java 17+ (tested on OpenJDK 17/21)
 
-## Building
+## Build
+No Maven/Gradle; compile with `javac`:
 
-### Manual Build
-Use `javac` with Java 21 (no external dependencies):
-
-**Bash (Git Bash/WSL/Linux/macOS):**
-```bash
-cd CSC4010-Distributed-Computing
-mkdir -p bin
-find src/main/java -name '*.java' -print0 | xargs -0 javac --release 17 -d bin
-```
-
-**PowerShell:**
+**PowerShell (Windows):**
 ```powershell
-cd CSC4010-Distributed-Computing
+cd Peer-to-Peer-UDP-Chat
 mkdir bin -Force
 $sources = Get-ChildItem -Recurse src/main/java -Filter *.java | % { $_.FullName }
 javac --release 17 -d bin $sources
 ```
 
-This produces class files in `bin`. Run the node with:
+**Bash (Git Bash/WSL/macOS/Linux):**
+```bash
+cd Peer-to-Peer-UDP-Chat
+mkdir -p bin
+find src/main/java -name '*.java' -print0 | xargs -0 javac --release 17 -d bin
+```
 
+## Run a Node (Console)
 ```powershell
-cd CSC4010-Distributed-Computing
 java -cp bin csc4010.chat.ChatNode --port 5000 --nick Alice
 ```
 
-There is no Maven/Gradle build file in this repo—compile with the `javac` command above whenever you change the sources (or script it however you prefer).
+Start a second peer and point it at the first:
+```powershell
+java -cp bin csc4010.chat.ChatNode --port 5001 --nick Bob --peer localhost:5000
+```
 
-## Running Multiple Peers
-1. Start the first node (no peers):
-   ```powershell
-   java -cp bin csc4010.chat.ChatNode --port 5000 --nick Alice
-   ```
-2. Start a second node and point it at Alice:
-   ```powershell
-   java -cp bin csc4010.chat.ChatNode --port 5001 --nick Bob --peer localhost:5000
-   ```
-3. Additional peers can list multiple `--peer host:port` seeds. Each peer shares its known peers via `PEERS` packets, so one seed is enough after the first hop.
-4. To join a different room: add `--room myroom` on startup or type `/room myroom` after launch (peers only exchange data within the same room).
+Room switch: `--room myroom` on startup or `/room myroom` at runtime (peers only interact within the same room).
 
-Optional flags:
-- `--drop-in 0.2 --drop-out 0.1` simulate lossy inbound/outbound links.
-- `--robot 5` start the robot chatterer upon launch (message every 5 seconds).
-- `--log logs/transcript.txt` append the ordered chat log to a file for external integrations.
-- `--http-port 8080` expose an HTTP API (`POST /chat`, `GET /history`, `GET /health`).
-- `--port auto` (or `--port 0`) lets the OS pick a free UDP port automatically—handy on lab machines where 5000 is busy. The node logs the actual port it binds to.
-- `--fanout 0` limit broadcast fan-out per relay (0 = send to all); `--ttl 0` sets chat relay hop limit (0 = unlimited). These help scale larger swarms without affecting small demos.
-- `--history-page 64` chunk history replay into pages of this size to avoid large bursts when new nodes sync.
-- `--discover-port 57500` adjust the UDP discovery beacon port (use `--no-discovery` to disable). If a port is taken the node will automatically try the next few values and warn you.
-- `--downloads path\to\folder` change where incoming binary files are saved (default `downloads/`).
-- `--gui` auto-starts the Swing GUI after the HTTP API comes up (auto-picks an HTTP port if you didn’t pass `--http-port`).
+### CLI Flags (ChatNode)
+- `--nick <name>` nickname (default Peer-XXXX)
+- `--port <n|auto|0>` UDP listen port (0/auto = OS chooses)
+- `--peer host:port` seed peer (repeatable)
+- `--room <name>` chat room (default lobby)
+- `--drop-in <0-1>` / `--drop-out <0-1>` simulate inbound/outbound loss
+- `--fanout <n>` limit broadcast fan-out per relay (0 = send to all)
+- `--ttl <n>` hop limit for relayed chats/history (0 = unlimited)
+- `--history-page <n>` page size for history replay (default 64)
+- `--log <path>` append ordered transcript to file
+- `--robot <seconds>` start robot chatterer on launch
+- `--lifetime <seconds>` auto-shutdown after given time
+- `--no-discovery` disable LAN discovery (default on)
+- `--discover-port <n>` UDP discovery port (default 57500)
+- `--http-port <n>` start HTTP API (0 = auto-pick)
+- `--downloads <dir>` where incoming files are saved (default `downloads/`)
+- `--gui` launch Swing GUI after HTTP starts (auto-picks HTTP port if omitted)
+- `--headless` / `--console` force console on/off
+- `--help` print usage
 
-## Console Commands
+### Console Commands (after node starts)
 | Command | Description |
 |---------|-------------|
 | `/help` | List commands |
-| `/peers` | Show known peers, IDs, and status |
+| `/peers` | Show known peers/rooms |
 | `/history` | Print local ordered log |
-| `/room <name>` | Switch active room (sends leave/hello, resyncs history) |
-| `/sync` | Request full history from a peer |
-| `/clear` | Drop local log then `/sync` automatically |
-| `/robot start <sec>` / `/robot stop` | Control the robot chat generator |
-| `/drop in|out <rate>` | Adjust simulated loss probabilities (0-1) |
-| `/nick <name>` | Change nickname and broadcast to peers |
-| `/sendfile <path>` | Send a binary file to all peers (saved under `downloads/` on receipt) |
-| `/discover` | Broadcast a new discovery probe (useful when joining with zero configuration) |
-| `/resend <messageId>` | Ask peers to resend a specific chat item |
-| `/forget <messageId>` | Remove a message locally (to simulate missing data) |
-| `/quit` | Gracefully disconnect (broadcasts `LEAVE`) |
+| `/room <name>` | Switch room (leave/hello + history resync) |
+| `/sync` | Request full history |
+| `/clear` | Drop local log then resync |
+| `/robot start <sec>` / `/robot stop` | Control robot chatter |
+| `/drop in|out <rate>` | Adjust simulated loss (0-1) |
+| `/nick <name>` | Change nickname and announce |
+| `/sendfile <path>` | Send a binary file to peers (saved under downloads) |
+| `/discover` | Broadcast discovery probe |
+| `/resend <messageId>` | Ask peers for a specific message |
+| `/forget <messageId>` | Remove a message locally |
+| `/quit` | Gracefully disconnect |
 
-## Simulating Failures
-- Use `/drop in 0.25` or CLI `--drop-in/--drop-out` to probabilistically discard packets.
-- `/forget <messageId>` removes a message locally and `/resend` pulls it back via `RESEND_REQ/RESEND_RES`.
-- `/clear` wipes the local log to demonstrate full history rebuilds.
-- `/sendfile` chunks a local binary (default 6 KB per packet) and streams it to peers. Received files land in the `downloads/` directory with automatic name deconfliction.
+### Scalability Controls
+- **Fan-out**: `--fanout N` randomly gossips to N peers per broadcast instead of all.
+- **TTL**: `--ttl N` caps relay depth (0 = unlimited).
+- **Drops**: `--drop-in/out` simulate lossy networks.
+- **History paging**: `--history-page` throttles replay bursts.
 
-## HTTP External Interface
-- Enable with `--http-port <port>`.
-- `POST /chat`  
-  - Body: either raw text or `text=hello&nick=Bot`.  
-  - Optional `nick` query/body parameter overrides the displayed nickname.  
-  - Successful posts return `200 OK`.
-- `GET /history` returns a JSON array of the current ordered chat log.
-- `GET /health` returns a JSON object with node id, nickname, peer count, and message count.
-This allows bots, scripts, or other applications to publish chat lines or poll node status without a console.
+### File Transfer
+- `/sendfile <path>` or HTTP control `sendfile` streams chunks over UDP.
+- Files land in `downloads/` (or `--downloads <dir>`) with collision-safe names.
 
-### Swing GUI (Wow-factor add-on)
-Fastest way: start a node with `--gui` (HTTP auto-binds if needed and the GUI launches):
+## HTTP API (enable with `--http-port <port|0>`)
+- `POST /chat` body `text=hello&nick=Bot` (form) or raw text. Returns 200 on success.
+- `GET /history` JSON array of ordered chat log.
+- `GET /health` JSON: node id, nickname, peer count, message count.
+- `POST /control` form actions:
+  - `room name=<room>`; `sync`; `clear`; `robot_start seconds=<n>`; `robot_stop`
+  - `drop_in rate=<0-1>`; `drop_out rate=<0-1>`
+  - `nick value=<name>`; `sendfile path=<file>`; `discover`
+  - `resend ids=<id1,id2>`; `forget id=<id>`; `quit`
 
-```powershell
-java -cp bin csc4010.chat.ChatNode --port 5000 --nick Alice --http-port 8080 --gui
-```
+## Swing GUI (ChatGuiApp)
+- Auto-launch with node flag: `--gui` (HTTP auto-picks a port if needed).
+- Or run separately against a node exposing HTTP:
+  ```powershell
+  java -cp bin csc4010.chat.ChatNode --port 5000 --nick Alice --http-port 8080
+  java -cp bin csc4010.chat.ChatGuiApp --server http://localhost:8080 --nick Alice-GUI --refresh 2
+  ```
+- GUI polls `/history`, posts via `/chat`, and issues `/control` actions (room switch, drop rates, robot, resend/forget, sendfile, quit).
 
-Prefer to attach from another machine or without auto-launch? Start the node with HTTP, then run the GUI separately:
+## Discovery (no seeds required)
+- Nodes probe UDP `--discover-port` (default 57500) and answer. Start without `--peer` and they will find each other on the LAN.
+- `/discover` forces a new probe. Use `--no-discovery` to isolate.
 
-```powershell
-java -cp bin csc4010.chat.ChatNode --port 5000 --nick Alice --http-port 8080
-java -cp bin csc4010.chat.ChatGuiApp --server http://localhost:8080 --nick Alice-GUI
-```
-
-The GUI polls `/history`, shows the ordered log, and posts via `/chat`. Use `--refresh 1` on the GUI to poll more aggressively or point `--server` at any peer exposing the HTTP API.
-
-## Discovery Without Seeds
-- Nodes listen on UDP discovery port `57500` (change with `--discover-port`).  
-- When started without `--peer`, they automatically broadcast probes and connect to any responders.  
-- Use `/discover` to manually re-run the probe; disable with `--no-discovery` if you need to isolate a node.
-- If the discovery port is already in use on your machine, the node will log
-  `Discovery disabled: failed to bind...`. Free the conflicting process (or pick a new port via `--discover-port <n>`) so you can still demonstrate auto-discovery for assessment credit.
-
-## Notes for the Report
-- `docs/ARCHITECTURE.md` documents the middleware protocol, message types, and wow-factor elements.
-- Highlight Lamport ordering, room-scoped messaging/history, peer discovery, loss simulation, and transcript export under “design” and “wow” sections.
+## Testing Ideas / Demos
+- Start 3 peers with `--fanout 2 --ttl 3` to show scalable gossip.
+- Toggle `/drop in 0.3` and watch resend/history recovery.
+- `/clear` + `/sync` to demonstrate full history rebuild.
+- Send a file and verify it appears under `downloads/` on other peers.
